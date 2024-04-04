@@ -1,1 +1,4 @@
 weaviate-client
+minio
+langserve
+langchain

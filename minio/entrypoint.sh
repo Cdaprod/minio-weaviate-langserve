@@ -14,7 +14,7 @@ done
 # Perform bucket setup
 mc alias set myminio http://localhost:9000 minio minio123
 mc mb myminio/weaviate-bucket
-mc mb myminio/langchain-bucket
+mc mb myminio/cda-datasets
 
 # Additional setup commands can go here
 
