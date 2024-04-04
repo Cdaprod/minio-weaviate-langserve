@@ -1,111 +1,66 @@
-import weaviate
-import json
+import os
+from fastapi import FastAPI
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langserve import add_routes
+from minio import Minio
+from weaviate import Client
 
-# Configuration
-WEAVIATE_ENDPOINT = "http://weaviate:8080"
-OUTPUT_FILE = "weaviate-data.json"
+os.environ["OPENAI_API_KEY"] = "your_openai_api_key"
 
-# Initialize the client
-client = weaviate.Client(WEAVIATE_ENDPOINT)
-schema = {
-    "classes": [
-        {
-            "class": "Article",
-            "description": "A class to store articles",
-            "properties": [
-                {"name": "title", "dataType": ["string"], "description": "The title of the article"},
-                {"name": "content", "dataType": ["text"], "description": "The content of the article"},
-                {"name": "datePublished", "dataType": ["date"], "description": "The date the article was published"},
-                {"name": "url", "dataType": ["string"], "description": "The URL of the article"}
-            ]
-        },
-        {
-            "class": "Author",
-            "description": "A class to store authors",
-            "properties": [
-                {"name": "name", "dataType": ["string"], "description": "The name of the author"},
-                {"name": "articles", "dataType": ["Article"], "description": "The articles written by the author"}
-            ]
-        }
-    ]
-}
+app = FastAPI()
 
-# Fresh delete classes
-try:
-    client.schema.delete_class('Article')
-    client.schema.delete_class('Author')
-except Exception as e:
-    print(f"Error deleting classes: {str(e)}")
+# Initialize Minio client
+minio_client = Minio(
+    "minio:9000",
+    access_key="minioadmin",
+    secret_key="minioadmin",
+    secure=False
+)
 
-# Create new schema
-try:
-    client.schema.create(schema)
-except Exception as e:
-    print(f"Error creating schema: {str(e)}")
+# Initialize Weaviate client
+weaviate_client = Client("http://weaviate:8080")
 
-data = [
-    {
-        "class": "Article",
-        "properties": {
-            "title": "LangChain: OpenAI + S3 Loader",
-            "content": "This article discusses the integration of LangChain with OpenAI and S3 Loader...",
-            "url": "https://blog.min.io/langchain-openai-s3-loader/"
-        }
-    },
-    {
-        "class": "Article",
-        "properties": {
-            "title": "MinIO Webhook Event Notifications",
-            "content": "Exploring the webhook event notification system in MinIO...",
-            "url": "https://blog.min.io/minio-webhook-event-notifications/"
-        }
-    },
-    {
-        "class": "Article",
-        "properties": {
-            "title": "MinIO Postgres Event Notifications",
-            "content": "An in-depth look at Postgres event notifications in MinIO...",
-            "url": "https://blog.min.io/minio-postgres-event-notifications/"
-        }
-    },
-    {
-        "class": "Article",
-        "properties": {
-            "title": "From Docker to Localhost",
-            "content": "A guide on transitioning from Docker to localhost environments...",
-            "url": "https://blog.min.io/from-docker-to-localhost/"
-        }
-    }
-]
+# Define prompt template for document processing
+document_processing_prompt = PromptTemplate.from_template("Summarize the following document: {document}")
+document_processing_chain = document_processing_prompt | ChatOpenAI()
 
-for item in data:
-    try:
-        client.data_object.create(
-            data_object=item["properties"],
-            class_name=item["class"]
-        )
-    except Exception as e:
-        print(f"Error indexing data: {str(e)}")
+# Define prompt template for query processing
+query_processing_prompt = PromptTemplate.from_template("Generate a search query for the following question: {question}")
+query_processing_chain = query_processing_prompt | ChatOpenAI()
 
-# Fetch and export objects
-try:
-    query = '{ Get { Article { title content datePublished url } } }'
-    result = client.query.raw(query)
-    articles = result['data']['Get']['Article']
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(articles, f, ensure_ascii=False, indent=4)
-    print(f"Exported {len(articles)} articles to {OUTPUT_FILE}")
-except Exception as e:
-    print(f"An error occurred: {str(e)}")
+# Langserve route for document processing
+add_routes(app, document_processing_chain, path="/process-document")
 
-# Create backup
-try:
-    result = client.backup.create(
-        backup_id="backup-id-2",
-        backend="s3",
-        include_classes=["Article", "Author"],
-        wait_for_completion=True,
+# Langserve route for query processing
+add_routes(app, query_processing_chain, path="/process-query")
+
+@app.post("/upload-document")
+async def upload_document(document: str):
+    # Upload document to Minio
+    minio_client.put_object("documents", "document.txt", document, len(document))
+
+    # Process document using Langchain
+    processed_document = document_processing_chain.run(document)
+
+    # Index processed document in Weaviate
+    weaviate_client.data_object.create(
+        data_object={"name": "document", "content": processed_document},
+        class_name="Document"
     )
-    print("Backup created successfully.")
-except Exception as e:
-    print(f"Error creating backup: {str(e)}")
+
+    return {"message": "Document uploaded and processed successfully"}
+
+@app.post("/search-documents")
+async def search_documents(question: str):
+    # Process query using Langchain
+    search_query = query_processing_chain.run(question)
+
+    # Search documents in Weaviate
+    result = weaviate_client.query.get("Document", ["content"]).with_where({"path": ["content"], "operator": "Contains", "valueText": search_query}).do()
+
+    return {"result": result}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
